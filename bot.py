@@ -75,6 +75,7 @@ def load_config():
         cfg.setdefault("buttons_rows", [])
         cfg.setdefault("interval", 10)
         cfg.setdefault("slave_intervals", {})
+        cfg.setdefault("slave_sources", {})
         cfg.setdefault("last_ids", {})
         cfg.setdefault("running", True)
         cfg.setdefault("rotation_indices", {})
@@ -85,6 +86,7 @@ def load_config():
         "targets": [],
         "interval": 10,
         "slave_intervals": {},
+        "slave_sources": {},
         "last_ids": {},
         "running": True,
         "buttons_rows": [],
@@ -114,12 +116,17 @@ async def update_slave_config(client, config):
     sources = [await resolve_name(s) for s in config.get("sources", [])]
     targets = [await resolve_name(t) for t in config.get("targets", [])]
 
+    resolved_slave_sources = {}
+    for slave_n, peer_ids in config.get("slave_sources", {}).items():
+        resolved_slave_sources[slave_n] = [await resolve_name(p) for p in peer_ids]
+
     slave_cfg = {
         "sources": sources,
         "targets": targets,
         "buttons_rows": config.get("buttons_rows", []),
         "interval": config.get("interval", 10),
         "slave_intervals": config.get("slave_intervals", {}),
+        "slave_sources": resolved_slave_sources,
         "running": config.get("running", True),
         "auto_reply_text": config.get("auto_reply_text", ""),
     }
@@ -614,6 +621,56 @@ async def main():
             await update_slave_config(client, config)
             await event.reply(f"🔄 Intervalli slave resettati — tutti usano il default master: **{config['interval']} min**")
 
+        # ── Sorgenti per slave ────────────────────────────────────────────────
+
+        elif text.startswith("/sa "):
+            try:
+                parts = text.split(maxsplit=2)
+                slave_n = str(int(parts[1]))
+                link    = parts[2].strip()
+                entity  = await client.get_entity(link)
+                peer_id = get_peer_id(entity)
+                name    = getattr(entity, "title", None) or getattr(entity, "username", None) or str(peer_id)
+                config.setdefault("slave_sources", {}).setdefault(slave_n, [])
+                if peer_id not in config["slave_sources"][slave_n]:
+                    config["slave_sources"][slave_n].append(peer_id)
+                    save_config(config)
+                    await update_slave_config(client, config)
+                    await event.reply(f"✅ Sorgente slave **{slave_n}** aggiunta: {name}")
+                else:
+                    await event.reply("⚠️ Già presente!")
+            except Exception as e:
+                await event.reply(f"❌ Errore: {e}\n\nUso: `/sa 1 https://t.me/canale`")
+
+        elif text.startswith("/ssl "):
+            try:
+                slave_n = str(int(text.split()[1]))
+                ids = config.get("slave_sources", {}).get(slave_n, [])
+                if not ids:
+                    await event.reply(f"Slave **{slave_n}** non ha sorgenti proprie — usa quelle del master ({len(config['sources'])}).")
+                else:
+                    names = []
+                    for pid in ids:
+                        try:
+                            ent = await client.get_entity(pid)
+                            names.append(getattr(ent, "username", None) and f"@{ent.username}" or getattr(ent, "title", str(pid)))
+                        except Exception:
+                            names.append(str(pid))
+                    out = "\n".join(f"  • {n}" for n in names)
+                    await event.reply(f"📥 **Sorgenti slave {slave_n}:**\n{out}\n\n`/sra {slave_n}` per resettare")
+            except Exception:
+                await event.reply("Uso: `/ssl 1`")
+
+        elif text.startswith("/sra "):
+            try:
+                slave_n = str(int(text.split()[1]))
+                config.setdefault("slave_sources", {}).pop(slave_n, None)
+                save_config(config)
+                await update_slave_config(client, config)
+                await event.reply(f"🔄 Slave **{slave_n}** ora usa le sorgenti del master.")
+            except Exception:
+                await event.reply("Uso: `/sra 1`")
+
         # ── Aiuto ─────────────────────────────────────────────────────────────
 
         elif text.startswith("/h"):
@@ -641,9 +698,12 @@ async def main():
                 "**Impostazioni:**\n"
                 "`/i 10` — intervallo master in minuti\n"
                 "`/si 1 5` — intervallo slave 1 a 5 min\n"
-                "`/si 2 10` — intervallo slave 2 a 10 min\n"
                 "`/sil` — lista intervalli slave\n"
-                "`/sir` — resetta intervalli slave al default"
+                "`/sir` — resetta intervalli slave al default\n\n"
+                "**Sorgenti per slave:**\n"
+                "`/sa 1 https://t.me/canale` — aggiungi sorgente allo slave 1\n"
+                "`/ssl 1` — mostra sorgenti slave 1\n"
+                "`/sra 1` — resetta sorgenti slave 1 (torna al master)"
             )
 
     spam_task = asyncio.create_task(spam_loop(client, config))
