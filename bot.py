@@ -13,7 +13,11 @@ Controlla tutti gli slave via HTTP. Invia comandi dai tuoi Messaggi Salvati.
   /off o /stop    — ferma lo spam
   /s              — stato, sorgenti e destinazioni
   /reset          — azzera sorgenti, destinazioni e cronologia
-  /i 10           — imposta intervallo a 10 minuti
+  /i 10           — imposta intervallo master a 10 minuti
+  /si 1 5         — imposta intervallo slave 1 a 5 minuti
+  /si 2 10        — imposta intervallo slave 2 a 10 minuti
+  /sil            — lista intervalli slave impostati
+  /sir            — resetta tutti gli intervalli slave al default
 
   Bottoni inline:
   /b              — mostra bottoni attuali + istruzioni
@@ -70,6 +74,7 @@ def load_config():
             cfg = json.load(f)
         cfg.setdefault("buttons_rows", [])
         cfg.setdefault("interval", 10)
+        cfg.setdefault("slave_intervals", {})
         cfg.setdefault("last_ids", {})
         cfg.setdefault("running", True)
         cfg.setdefault("rotation_indices", {})
@@ -79,6 +84,7 @@ def load_config():
         "sources": [],
         "targets": [],
         "interval": 10,
+        "slave_intervals": {},
         "last_ids": {},
         "running": True,
         "buttons_rows": [],
@@ -113,6 +119,7 @@ async def update_slave_config(client, config):
         "targets": targets,
         "buttons_rows": config.get("buttons_rows", []),
         "interval": config.get("interval", 10),
+        "slave_intervals": config.get("slave_intervals", {}),
         "running": config.get("running", True),
         "auto_reply_text": config.get("auto_reply_text", ""),
     }
@@ -417,9 +424,16 @@ async def main():
             stato = "🟢 Attivo" if config["running"] else "🔴 Fermo"
             n_btn = sum(len(r) for r in config.get("buttons_rows", []))
             reply_text = config.get("auto_reply_text", "")
+            slave_intervals = config.get("slave_intervals", {})
+            si_lines = ""
+            if slave_intervals:
+                si_lines = "\n" + "\n".join(
+                    f"  • Slave {k}: {v} min" for k, v in sorted(slave_intervals.items(), key=lambda x: int(x[0]))
+                )
             out = (
                 f"📊 **STATO** — {stato}\n\n"
-                f"⏰ Intervallo: {config['interval']} min\n"
+                f"⏰ Intervallo master: {config['interval']} min\n"
+                f"🕐 Intervalli slave:{si_lines or ' (default master)'}\n"
                 f"📥 Sorgenti: {len(config['sources'])}\n"
                 f"📤 Destinazioni: {len(config['targets'])}\n"
                 f"🔘 Bottoni: {n_btn}\n"
@@ -570,9 +584,35 @@ async def main():
                 config["interval"] = mins
                 save_config(config)
                 await update_slave_config(client, config)
-                await event.reply(f"⏰ Intervallo impostato a **{mins} minuti** — applicato a tutti gli slave al prossimo ciclo.")
+                await event.reply(f"⏰ Intervallo master impostato a **{mins} minuti**.")
             except Exception:
                 await event.reply("Uso: `/i 10`")
+
+        elif text.startswith("/si "):
+            try:
+                parts = text.split()
+                slave_n = str(int(parts[1]))
+                mins    = max(1, int(parts[2]))
+                config.setdefault("slave_intervals", {})[slave_n] = mins
+                save_config(config)
+                await update_slave_config(client, config)
+                await event.reply(f"🕐 Slave **{slave_n}** → intervallo impostato a **{mins} minuti**.")
+            except Exception:
+                await event.reply("Uso: `/si 1 5`  (slave numero - minuti)")
+
+        elif text == "/sil":
+            si = config.get("slave_intervals", {})
+            if not si:
+                await event.reply(f"Nessun intervallo slave personalizzato.\nTutti usano il default master: **{config['interval']} min**")
+            else:
+                lines = "\n".join(f"  • Slave {k}: {v} min" for k, v in sorted(si.items(), key=lambda x: int(x[0])))
+                await event.reply(f"🕐 **Intervalli slave:**\n{lines}\n\n_(default master: {config['interval']} min)_")
+
+        elif text == "/sir":
+            config["slave_intervals"] = {}
+            save_config(config)
+            await update_slave_config(client, config)
+            await event.reply(f"🔄 Intervalli slave resettati — tutti usano il default master: **{config['interval']} min**")
 
         # ── Aiuto ─────────────────────────────────────────────────────────────
 
@@ -599,7 +639,11 @@ async def main():
                 "`/replyshow` — mostra stato auto-risposta\n"
                 "`/replyclear` — cancella testo\n\n"
                 "**Impostazioni:**\n"
-                "`/i 10` — intervallo in minuti"
+                "`/i 10` — intervallo master in minuti\n"
+                "`/si 1 5` — intervallo slave 1 a 5 min\n"
+                "`/si 2 10` — intervallo slave 2 a 10 min\n"
+                "`/sil` — lista intervalli slave\n"
+                "`/sir` — resetta intervalli slave al default"
             )
 
     spam_task = asyncio.create_task(spam_loop(client, config))
