@@ -6,17 +6,7 @@ Controlla tutti gli slave via HTTP. Invia comandi dai tuoi Messaggi Salvati.
 ── VARIABILI D'AMBIENTE ───────────────────────────────────────────────────────
   API_ID          — API ID dell'account master (da my.telegram.org)
   API_HASH        — API Hash dell'account master
-  SESSION_STRING  — Session string (lascia vuota al primo avvio)
-
-── COMANDI (in "Messaggi Salvati") ────────────────────────────────────────────
-  /on  o /start   — avvia lo spam (parte subito)
-  /off o /stop    — ferma lo spam
-  /s              — stato, sorgenti e destinazioni
-  /reset          — azzera sorgenti, destinazioni e cronologia
-  /i 10           — imposta intervallo master a 10 minuti
-  /si 1 5         — imposta intervallo slave 1 a 5 minuti
-  /si 2 10        — imposta intervallo slave 2 a 10 minuti
-  /sil            — lista intervalli slave impostati
+  SESSION_STRINAostati
   /sir            — resetta tutti gli intervalli slave al default
 
   Bottoni inline:
@@ -247,7 +237,7 @@ async def add_folder_to_list(client, event, folder_name: str, is_source: bool):
 
 # ── Invio messaggi ────────────────────────────────────────────────────────────
 
-async def copy_to_target(client, msg, target, config):
+async def copy_to_target(client, msg, target, config, _retries=0):
     try:
         text     = msg.message or getattr(msg, "caption", "") or ""
         entities = msg.entities or []
@@ -272,9 +262,12 @@ async def copy_to_target(client, msg, target, config):
             )
         logger.info(f"✅ msg {msg.id} → {target}")
     except FloodWaitError as e:
-        logger.warning(f"FloodWait {e.seconds}s")
+        if _retries >= 3:
+            logger.error(f"FloodWait ripetuto ({_retries}x) su {target}, messaggio saltato.")
+            return
+        logger.warning(f"FloodWait {e.seconds}s (tentativo {_retries + 1}/3)")
         await asyncio.sleep(e.seconds + 1)
-        await copy_to_target(client, msg, target, config)
+        await copy_to_target(client, msg, target, config, _retries + 1)
     except Exception as e:
         logger.error(f"Errore → {target}: {e}")
 
@@ -414,14 +407,14 @@ async def main():
 
         # ── Comandi ───────────────────────────────────────────────────────────
 
-        if text.startswith("/on") or text.startswith("/start"):
+        if text in ["/on", "/start"] or text.startswith("/on ") or text.startswith("/start "):
             config["running"] = True
             save_config(config)
             await update_slave_config(client, config)
             trigger_now.set()
             await event.reply("✅ Avviato — controllo immediato in corso...")
 
-        elif text.startswith("/off") or text.startswith("/stop"):
+        elif text in ["/off", "/stop"] or text.startswith("/off ") or text.startswith("/stop "):
             config["running"] = False
             save_config(config)
             await update_slave_config(client, config)
@@ -448,7 +441,7 @@ async def main():
             )
             await event.reply(out)
 
-        elif text.startswith("/reset"):
+        elif text == "/reset":
             config["sources"]          = []
             config["targets"]          = []
             config["last_ids"]         = {}
@@ -538,7 +531,7 @@ async def main():
 
         # ── Cartelle ──────────────────────────────────────────────────────────
 
-        elif text.startswith("/lf"):
+        elif text == "/lf":
             try:
                 folders = await get_folders(client)
                 if not folders:
@@ -563,6 +556,56 @@ async def main():
             name  = parts[1].strip() if len(parts) > 1 else ""
             await (add_folder_to_list(client, event, name, False) if name
                    else event.reply("Uso: `/tf NomeCartella`"))
+
+        # ── Sorgenti per slave ────────────────────────────────────────────────
+
+        elif text.startswith("/sa "):
+            try:
+                parts = text.split(maxsplit=2)
+                slave_n = str(int(parts[1]))
+                link    = parts[2].strip()
+                entity  = await client.get_entity(link)
+                peer_id = get_peer_id(entity)
+                name    = getattr(entity, "title", None) or getattr(entity, "username", None) or str(peer_id)
+                config.setdefault("slave_sources", {}).setdefault(slave_n, [])
+                if peer_id not in config["slave_sources"][slave_n]:
+                    config["slave_sources"][slave_n].append(peer_id)
+                    save_config(config)
+                    await update_slave_config(client, config)
+                    await event.reply(f"✅ Sorgente slave **{slave_n}** aggiunta: {name}")
+                else:
+                    await event.reply("⚠️ Già presente!")
+            except Exception as e:
+                await event.reply(f"❌ Errore: {e}\n\nUso: `/sa 1 https://t.me/canale`")
+
+        elif text.startswith("/ssl "):
+            try:
+                slave_n = str(int(text.split()[1]))
+                ids = config.get("slave_sources", {}).get(slave_n, [])
+                if not ids:
+                    await event.reply(f"Slave **{slave_n}** non ha sorgenti proprie — usa quelle del master ({len(config['sources'])}).")
+                else:
+                    names = []
+                    for pid in ids:
+                        try:
+                            ent = await client.get_entity(pid)
+                            names.append(getattr(ent, "username", None) and f"@{ent.username}" or getattr(ent, "title", str(pid)))
+                        except Exception:
+                            names.append(str(pid))
+                    out = "\n".join(f"  • {n}" for n in names)
+                    await event.reply(f"📥 **Sorgenti slave {slave_n}:**\n{out}\n\n`/sra {slave_n}` per resettare")
+            except Exception:
+                await event.reply("Uso: `/ssl 1`")
+
+        elif text.startswith("/sra "):
+            try:
+                slave_n = str(int(text.split()[1]))
+                config.setdefault("slave_sources", {}).pop(slave_n, None)
+                save_config(config)
+                await update_slave_config(client, config)
+                await event.reply(f"🔄 Slave **{slave_n}** ora usa le sorgenti del master.")
+            except Exception:
+                await event.reply("Uso: `/sra 1`")
 
         # ── Entità singola ────────────────────────────────────────────────────
 
@@ -621,59 +664,9 @@ async def main():
             await update_slave_config(client, config)
             await event.reply(f"🔄 Intervalli slave resettati — tutti usano il default master: **{config['interval']} min**")
 
-        # ── Sorgenti per slave ────────────────────────────────────────────────
-
-        elif text.startswith("/sa "):
-            try:
-                parts = text.split(maxsplit=2)
-                slave_n = str(int(parts[1]))
-                link    = parts[2].strip()
-                entity  = await client.get_entity(link)
-                peer_id = get_peer_id(entity)
-                name    = getattr(entity, "title", None) or getattr(entity, "username", None) or str(peer_id)
-                config.setdefault("slave_sources", {}).setdefault(slave_n, [])
-                if peer_id not in config["slave_sources"][slave_n]:
-                    config["slave_sources"][slave_n].append(peer_id)
-                    save_config(config)
-                    await update_slave_config(client, config)
-                    await event.reply(f"✅ Sorgente slave **{slave_n}** aggiunta: {name}")
-                else:
-                    await event.reply("⚠️ Già presente!")
-            except Exception as e:
-                await event.reply(f"❌ Errore: {e}\n\nUso: `/sa 1 https://t.me/canale`")
-
-        elif text.startswith("/ssl "):
-            try:
-                slave_n = str(int(text.split()[1]))
-                ids = config.get("slave_sources", {}).get(slave_n, [])
-                if not ids:
-                    await event.reply(f"Slave **{slave_n}** non ha sorgenti proprie — usa quelle del master ({len(config['sources'])}).")
-                else:
-                    names = []
-                    for pid in ids:
-                        try:
-                            ent = await client.get_entity(pid)
-                            names.append(getattr(ent, "username", None) and f"@{ent.username}" or getattr(ent, "title", str(pid)))
-                        except Exception:
-                            names.append(str(pid))
-                    out = "\n".join(f"  • {n}" for n in names)
-                    await event.reply(f"📥 **Sorgenti slave {slave_n}:**\n{out}\n\n`/sra {slave_n}` per resettare")
-            except Exception:
-                await event.reply("Uso: `/ssl 1`")
-
-        elif text.startswith("/sra "):
-            try:
-                slave_n = str(int(text.split()[1]))
-                config.setdefault("slave_sources", {}).pop(slave_n, None)
-                save_config(config)
-                await update_slave_config(client, config)
-                await event.reply(f"🔄 Slave **{slave_n}** ora usa le sorgenti del master.")
-            except Exception:
-                await event.reply("Uso: `/sra 1`")
-
         # ── Aiuto ─────────────────────────────────────────────────────────────
 
-        elif text.startswith("/h"):
+        elif text in ["/h", "/help"]:
             await event.reply(
                 "📋 **COMANDI MASTER**\n\n"
                 "`/on` — avvia (parte subito)\n"
