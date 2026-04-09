@@ -89,34 +89,14 @@ def save_config(config):
         json.dump(config, f, ensure_ascii=False, indent=4)
 
 async def update_slave_config(client, config):
-    """Genera slave_config.json con username leggibili. Letto dagli slave via HTTP."""
-    async def resolve_name(peer_id):
-        try:
-            ent = await client.get_entity(peer_id)
-            username = getattr(ent, "username", None)
-            if username:
-                return f"@{username}"
-            title = getattr(ent, "title", None)
-            if title:
-                return title
-        except Exception:
-            pass
-        return str(peer_id)
-
-    sources = [await resolve_name(s) for s in config.get("sources", [])]
-    targets = [await resolve_name(t) for t in config.get("targets", [])]
-
-    resolved_slave_sources = {}
-    for slave_n, peer_ids in config.get("slave_sources", {}).items():
-        resolved_slave_sources[slave_n] = [await resolve_name(p) for p in peer_ids]
-
+    """Genera slave_config.json con peer ID numerici. Letto dagli slave via HTTP."""
     slave_cfg = {
-        "sources": sources,
-        "targets": targets,
+        "sources": config.get("sources", []),
+        "targets": config.get("targets", []),
         "buttons_rows": config.get("buttons_rows", []),
         "interval": config.get("interval", 10),
         "slave_intervals": config.get("slave_intervals", {}),
-        "slave_sources": resolved_slave_sources,
+        "slave_sources": config.get("slave_sources", {}),
         "running": config.get("running", True),
         "auto_reply_text": config.get("auto_reply_text", ""),
     }
