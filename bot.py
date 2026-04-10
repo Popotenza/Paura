@@ -89,26 +89,25 @@ def save_config(config):
         json.dump(config, f, ensure_ascii=False, indent=4)
 
 async def update_slave_config(client, config):
-    """Genera slave_config.json con username leggibili. Letto dagli slave via HTTP."""
-    async def resolve_name(peer_id):
+    """Genera slave_config.json. Usa @username se disponibile, altrimenti peer ID numerico."""
+    async def resolve_entity(peer_id):
+        """Restituisce @username (se esiste) o il peer ID numerico intero.
+        MAI il titolo: il titolo non è un identificativo valido per Telethon."""
         try:
             ent = await client.get_entity(peer_id)
             username = getattr(ent, "username", None)
             if username:
                 return f"@{username}"
-            title = getattr(ent, "title", None)
-            if title:
-                return title
         except Exception:
             pass
-        return str(peer_id)
+        return peer_id  # intero, non stringa
 
-    sources = [await resolve_name(s) for s in config.get("sources", [])]
-    targets = [await resolve_name(t) for t in config.get("targets", [])]
+    sources = [await resolve_entity(s) for s in config.get("sources", [])]
+    targets = [await resolve_entity(t) for t in config.get("targets", [])]
 
     resolved_slave_sources = {}
     for slave_n, peer_ids in config.get("slave_sources", {}).items():
-        resolved_slave_sources[slave_n] = [await resolve_name(p) for p in peer_ids]
+        resolved_slave_sources[slave_n] = [await resolve_entity(p) for p in peer_ids]
 
     slave_cfg = {
         "sources": sources,
@@ -397,7 +396,7 @@ async def main():
 
     globals()["pending_link"] = None
 
-    @client.on(events.NewMessage(chats="me"))
+    @client.on(events.NewMessage(chats="me", outgoing=True))
     async def command_handler(event):
         global config
         text = (event.message.text or "").strip()
@@ -425,16 +424,23 @@ async def main():
             n_btn = sum(len(r) for r in config.get("buttons_rows", []))
             reply_text = config.get("auto_reply_text", "")
             slave_intervals = config.get("slave_intervals", {})
+            slave_sources = config.get("slave_sources", {})
             si_lines = ""
             if slave_intervals:
                 si_lines = "\n" + "\n".join(
                     f"  • Slave {k}: {v} min" for k, v in sorted(slave_intervals.items(), key=lambda x: int(x[0]))
                 )
+            ss_lines = ""
+            if slave_sources:
+                ss_lines = "\n" + "\n".join(
+                    f"  • Slave {k}: {len(v)} sorgenti proprie" for k, v in sorted(slave_sources.items(), key=lambda x: int(x[0]))
+                )
             out = (
                 f"📊 **STATO** — {stato}\n\n"
                 f"⏰ Intervallo master: {config['interval']} min\n"
                 f"🕐 Intervalli slave:{si_lines or ' (default master)'}\n"
-                f"📥 Sorgenti: {len(config['sources'])}\n"
+                f"📥 Sorgenti master: {len(config['sources'])}\n"
+                f"📥 Sorgenti slave:{ss_lines or ' (usano master)'}\n"
                 f"📤 Destinazioni: {len(config['targets'])}\n"
                 f"🔘 Bottoni: {n_btn}\n"
                 f"💬 Auto-risposta: {'✅ attiva' if reply_text else '❌ non impostata'}"
@@ -664,6 +670,34 @@ async def main():
             await update_slave_config(client, config)
             await event.reply(f"🔄 Intervalli slave resettati — tutti usano il default master: **{config['interval']} min**")
 
+        # ── Debug / Refresh ───────────────────────────────────────────────────
+
+        elif text == "/refresh":
+            await update_slave_config(client, config)
+            if os.path.exists(SLAVE_CONFIG_FILE):
+                with open(SLAVE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    sc = json.load(f)
+                await event.reply(
+                    f"🔄 **slave_config.json rigenerato**\n\n"
+                    f"📥 Sorgenti master: {sc.get('sources', [])}\n"
+                    f"📤 Destinazioni: {sc.get('targets', [])}\n"
+                    f"🔀 Sorgenti slave: {sc.get('slave_sources', {})}\n"
+                    f"⏱ Intervallo: {sc.get('interval')} min\n"
+                    f"▶️ Running: {sc.get('running')}"
+                )
+            else:
+                await event.reply("⚠️ slave_config.json non trovato dopo il refresh.")
+
+        elif text == "/debug":
+            if not os.path.exists(SLAVE_CONFIG_FILE):
+                await update_slave_config(client, config)
+            if os.path.exists(SLAVE_CONFIG_FILE):
+                with open(SLAVE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    content = f.read()
+                await event.reply(f"🔍 **slave_config.json attuale:**\n\n```\n{content[:3000]}\n```")
+            else:
+                await event.reply("❌ slave_config.json non trovato. Manda /on o /refresh per generarlo.")
+
         # ── Aiuto ─────────────────────────────────────────────────────────────
 
         elif text in ["/h", "/help"]:
@@ -696,7 +730,10 @@ async def main():
                 "**Sorgenti per slave:**\n"
                 "`/sa 1 https://t.me/canale` — aggiungi sorgente allo slave 1\n"
                 "`/ssl 1` — mostra sorgenti slave 1\n"
-                "`/sra 1` — resetta sorgenti slave 1 (torna al master)"
+                "`/sra 1` — resetta sorgenti slave 1 (torna al master)\n\n"
+                "**Diagnostica:**\n"
+                "`/debug` — mostra slave_config.json (cosa vedono gli slave)\n"
+                "`/refresh` — rigenera slave_config.json"
             )
 
     spam_task = asyncio.create_task(spam_loop(client, config))
