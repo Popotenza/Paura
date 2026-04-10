@@ -6,7 +6,23 @@ Controlla tutti gli slave via HTTP. Invia comandi dai tuoi Messaggi Salvati.
 ── VARIABILI D'AMBIENTE ───────────────────────────────────────────────────────
   API_ID          — API ID dell'account master (da my.telegram.org)
   API_HASH        — API Hash dell'account master
-  SESSION_STRINAostati
+  SESSION_STRING  — Session string (lascia vuota al primo avvio)
+
+── COMANDI ────────────────────────────────────────────────────────────────────
+
+  Controllo base:
+  /on             — avvia (manda subito un post)
+  /off            — ferma
+  /s              — stato completo
+  /reset          — azzera sorgenti e destinazioni
+  /refresh        — rigenera slave_config.json
+  /debug          — mostra slave_config.json attuale
+  /h              — aiuto
+
+  Impostazioni intervallo:
+  /i N            — intervallo master in minuti
+  /si N M         — intervallo slave N a M minuti
+  /sil            — lista intervalli slave
   /sir            — resetta tutti gli intervalli slave al default
 
   Bottoni inline:
@@ -19,16 +35,29 @@ Controlla tutti gli slave via HTTP. Invia comandi dai tuoi Messaggi Salvati.
   /tf NomeCartella — aggiungi cartella come destinazioni
 
   Canale singolo:
-  /a https://t.me/... — aggiungi sorgente
+  /a https://t.me/... — aggiungi sorgente master
   /d https://t.me/... — aggiungi destinazione
+
+  Sorgenti per slave specifico:
+  /sa N https://t.me/... — aggiungi sorgente allo slave N
+  /ssl N          — mostra sorgenti slave N
+  /sra N          — resetta sorgenti slave N (torna al master)
+
+  Addlist slave (link di aggiunta a gruppi/canali):
+  /al             — mostra tutte le addlist configurate
+  /ala N https://t.me/joinchat/... — aggiungi addlist per lo slave N
+  /all N          — lista addlist slave N
+  /alr N          — rimuovi tutte le addlist dello slave N
+  /alra N I       — rimuovi addlist numero I dello slave N
+  /alg https://t.me/joinchat/... — aggiungi addlist globale (tutti gli slave)
+  /algl           — lista addlist globali
+  /algr           — rimuovi tutte le addlist globali
 
   Auto-risposta PM (per gli slave):
   /replytext Ciao {first_name}! ... — imposta testo auto-risposta
   /replytext            — mostra testo attuale
   /replyshow            — mostra testo attuale
   /replyclear           — cancella il testo auto-risposta
-
-  /h              — aiuto
 """
 
 import asyncio
@@ -70,6 +99,8 @@ def load_config():
         cfg.setdefault("running", True)
         cfg.setdefault("rotation_indices", {})
         cfg.setdefault("auto_reply_text", "")
+        cfg.setdefault("slave_addlists", {})   # addlist per slave specifico: {"1": [...], "2": [...]}
+        cfg.setdefault("global_addlists", [])  # addlist per tutti gli slave
         return cfg
     return {
         "sources": [],
@@ -82,6 +113,8 @@ def load_config():
         "buttons_rows": [],
         "rotation_indices": {},
         "auto_reply_text": "",
+        "slave_addlists": {},
+        "global_addlists": [],
     }
 
 def save_config(config):
@@ -91,8 +124,6 @@ def save_config(config):
 async def update_slave_config(client, config):
     """Genera slave_config.json. Usa @username se disponibile, altrimenti peer ID numerico."""
     async def resolve_entity(peer_id):
-        """Restituisce @username (se esiste) o il peer ID numerico intero.
-        MAI il titolo: il titolo non è un identificativo valido per Telethon."""
         try:
             ent = await client.get_entity(peer_id)
             username = getattr(ent, "username", None)
@@ -100,7 +131,7 @@ async def update_slave_config(client, config):
                 return f"@{username}"
         except Exception:
             pass
-        return peer_id  # intero, non stringa
+        return peer_id
 
     sources = [await resolve_entity(s) for s in config.get("sources", [])]
     targets = [await resolve_entity(t) for t in config.get("targets", [])]
@@ -118,6 +149,8 @@ async def update_slave_config(client, config):
         "slave_sources": resolved_slave_sources,
         "running": config.get("running", True),
         "auto_reply_text": config.get("auto_reply_text", ""),
+        "slave_addlists": config.get("slave_addlists", {}),
+        "global_addlists": config.get("global_addlists", []),
     }
     with open(SLAVE_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(slave_cfg, f, ensure_ascii=False, indent=4)
@@ -335,6 +368,15 @@ async def add_entity(client, event, link: str, is_source: bool):
         await event.reply(f"❌ Impossibile aggiungere:\n{str(e)}")
 
 
+# ── Addlist helpers ───────────────────────────────────────────────────────────
+
+def format_addlist(links: list, title: str) -> str:
+    if not links:
+        return f"Nessuna addlist in **{title}**."
+    lines = "\n".join(f"  {i+1}. {url}" for i, url in enumerate(links))
+    return f"🔗 **{title}** ({len(links)}):\n{lines}"
+
+
 # ── HTTP server ───────────────────────────────────────────────────────────────
 
 async def start_http_server():
@@ -425,6 +467,8 @@ async def main():
             reply_text = config.get("auto_reply_text", "")
             slave_intervals = config.get("slave_intervals", {})
             slave_sources = config.get("slave_sources", {})
+            slave_addlists = config.get("slave_addlists", {})
+            global_addlists = config.get("global_addlists", [])
             si_lines = ""
             if slave_intervals:
                 si_lines = "\n" + "\n".join(
@@ -435,6 +479,12 @@ async def main():
                 ss_lines = "\n" + "\n".join(
                     f"  • Slave {k}: {len(v)} sorgenti proprie" for k, v in sorted(slave_sources.items(), key=lambda x: int(x[0]))
                 )
+            al_lines = ""
+            total_sal = sum(len(v) for v in slave_addlists.values())
+            if slave_addlists or global_addlists:
+                al_lines = f"\n  • Globali: {len(global_addlists)}"
+                for k, v in sorted(slave_addlists.items(), key=lambda x: int(x[0])):
+                    al_lines += f"\n  • Slave {k}: {len(v)}"
             out = (
                 f"📊 **STATO** — {stato}\n\n"
                 f"⏰ Intervallo master: {config['interval']} min\n"
@@ -443,6 +493,7 @@ async def main():
                 f"📥 Sorgenti slave:{ss_lines or ' (usano master)'}\n"
                 f"📤 Destinazioni: {len(config['targets'])}\n"
                 f"🔘 Bottoni: {n_btn}\n"
+                f"🔗 Addlist:{al_lines or ' nessuna'}\n"
                 f"💬 Auto-risposta: {'✅ attiva' if reply_text else '❌ non impostata'}"
             )
             await event.reply(out)
@@ -613,6 +664,112 @@ async def main():
             except Exception:
                 await event.reply("Uso: `/sra 1`")
 
+        # ── Addlist slave ─────────────────────────────────────────────────────
+
+        elif text == "/al":
+            slave_addlists  = config.get("slave_addlists", {})
+            global_addlists = config.get("global_addlists", [])
+            out = "🔗 **ADDLIST**\n\n"
+            out += format_addlist(global_addlists, "Globali (tutti gli slave)") + "\n\n"
+            if slave_addlists:
+                for k in sorted(slave_addlists.keys(), key=int):
+                    out += format_addlist(slave_addlists[k], f"Slave {k}") + "\n\n"
+            else:
+                out += "Nessuna addlist per slave specifici.\n"
+            out += (
+                "\n**Comandi:**\n"
+                "`/ala N link` — addlist per slave N\n"
+                "`/all N` — lista addlist slave N\n"
+                "`/alr N` — rimuovi tutte addlist slave N\n"
+                "`/alra N I` — rimuovi addlist numero I dello slave N\n"
+                "`/alg link` — addlist globale\n"
+                "`/algl` — lista addlist globali\n"
+                "`/algr` — rimuovi tutte le addlist globali"
+            )
+            await event.reply(out)
+
+        elif text.startswith("/ala "):
+            try:
+                parts = text.split(maxsplit=2)
+                slave_n = str(int(parts[1]))
+                link    = parts[2].strip()
+                config.setdefault("slave_addlists", {}).setdefault(slave_n, [])
+                if link not in config["slave_addlists"][slave_n]:
+                    config["slave_addlists"][slave_n].append(link)
+                    save_config(config)
+                    await update_slave_config(client, config)
+                    total = len(config["slave_addlists"][slave_n])
+                    await event.reply(f"✅ Addlist aggiunta per slave **{slave_n}** ({total} totali):\n`{link}`")
+                else:
+                    await event.reply("⚠️ Addlist già presente per questo slave!")
+            except Exception as e:
+                await event.reply(f"❌ Errore: {e}\n\nUso: `/ala 1 https://t.me/joinchat/...`")
+
+        elif text.startswith("/all "):
+            try:
+                slave_n = str(int(text.split()[1]))
+                links   = config.get("slave_addlists", {}).get(slave_n, [])
+                await event.reply(format_addlist(links, f"Addlist slave {slave_n}") +
+                                  f"\n\n`/alra {slave_n} N` — rimuovi addlist numero N\n`/alr {slave_n}` — rimuovi tutte")
+            except Exception:
+                await event.reply("Uso: `/all 1`")
+
+        elif text.startswith("/alr "):
+            try:
+                slave_n = str(int(text.split()[1]))
+                removed = len(config.get("slave_addlists", {}).get(slave_n, []))
+                config.setdefault("slave_addlists", {}).pop(slave_n, None)
+                save_config(config)
+                await update_slave_config(client, config)
+                await event.reply(f"🗑 Rimosse **{removed}** addlist dello slave **{slave_n}**.")
+            except Exception:
+                await event.reply("Uso: `/alr 1`")
+
+        elif text.startswith("/alra "):
+            try:
+                parts   = text.split()
+                slave_n = str(int(parts[1]))
+                idx     = int(parts[2]) - 1  # 1-based in UI, 0-based internamente
+                links   = config.setdefault("slave_addlists", {}).get(slave_n, [])
+                if 0 <= idx < len(links):
+                    removed = links.pop(idx)
+                    if not links:
+                        config["slave_addlists"].pop(slave_n, None)
+                    save_config(config)
+                    await update_slave_config(client, config)
+                    await event.reply(f"🗑 Rimossa addlist {idx+1} dello slave **{slave_n}**:\n`{removed}`")
+                else:
+                    await event.reply(f"❌ Numero non valido. Slave {slave_n} ha {len(links)} addlist.")
+            except Exception as e:
+                await event.reply(f"❌ Errore: {e}\n\nUso: `/alra 1 2` (slave 1, addlist numero 2)")
+
+        elif text.startswith("/alg "):
+            try:
+                link = text.split(maxsplit=1)[1].strip()
+                config.setdefault("global_addlists", [])
+                if link not in config["global_addlists"]:
+                    config["global_addlists"].append(link)
+                    save_config(config)
+                    await update_slave_config(client, config)
+                    total = len(config["global_addlists"])
+                    await event.reply(f"✅ Addlist globale aggiunta ({total} totali):\n`{link}`")
+                else:
+                    await event.reply("⚠️ Addlist già presente nelle globali!")
+            except Exception as e:
+                await event.reply(f"❌ Errore: {e}\n\nUso: `/alg https://t.me/joinchat/...`")
+
+        elif text == "/algl":
+            links = config.get("global_addlists", [])
+            await event.reply(format_addlist(links, "Addlist globali") +
+                              "\n\n`/algr` — rimuovi tutte")
+
+        elif text == "/algr":
+            removed = len(config.get("global_addlists", []))
+            config["global_addlists"] = []
+            save_config(config)
+            await update_slave_config(client, config)
+            await event.reply(f"🗑 Rimosse **{removed}** addlist globali.")
+
         # ── Entità singola ────────────────────────────────────────────────────
 
         elif text.startswith("/a "):
@@ -683,7 +840,9 @@ async def main():
                     f"📤 Destinazioni: {sc.get('targets', [])}\n"
                     f"🔀 Sorgenti slave: {sc.get('slave_sources', {})}\n"
                     f"⏱ Intervallo: {sc.get('interval')} min\n"
-                    f"▶️ Running: {sc.get('running')}"
+                    f"▶️ Running: {sc.get('running')}\n"
+                    f"🔗 Addlist globali: {len(sc.get('global_addlists', []))}\n"
+                    f"🔗 Addlist slave: { {k: len(v) for k, v in sc.get('slave_addlists', {}).items()} }"
                 )
             else:
                 await event.reply("⚠️ slave_config.json non trovato dopo il refresh.")
@@ -731,6 +890,15 @@ async def main():
                 "`/sa 1 https://t.me/canale` — aggiungi sorgente allo slave 1\n"
                 "`/ssl 1` — mostra sorgenti slave 1\n"
                 "`/sra 1` — resetta sorgenti slave 1 (torna al master)\n\n"
+                "**Addlist slave:**\n"
+                "`/al` — mostra tutte le addlist\n"
+                "`/ala 1 https://t.me/joinchat/...` — addlist per slave 1\n"
+                "`/all 1` — lista addlist slave 1\n"
+                "`/alr 1` — rimuovi tutte addlist slave 1\n"
+                "`/alra 1 2` — rimuovi addlist n.2 dello slave 1\n"
+                "`/alg https://t.me/joinchat/...` — addlist globale (tutti)\n"
+                "`/algl` — lista addlist globali\n"
+                "`/algr` — rimuovi tutte le addlist globali\n\n"
                 "**Diagnostica:**\n"
                 "`/debug` — mostra slave_config.json (cosa vedono gli slave)\n"
                 "`/refresh` — rigenera slave_config.json"
