@@ -1028,8 +1028,11 @@ async def main() -> None:
 
         elif "t.me/addlist/" in text.lower() or "telegram.me/addlist/" in text.lower():
             # ── Link t.me/addlist/ rilevato automaticamente ────────
-            # Chiediamo subito se va aggiunta come globale o per uno slave
-            globals()["pending_addlist"] = text.strip()
+            # Estraiamo solo l'URL dal messaggio
+            import re
+            match = re.search(r'https?://(?:t\.me|telegram\.me)/addlist/\S+', text, re.IGNORECASE)
+            extracted_link = match.group(0) if match else text.strip()
+            globals()["pending_addlist"] = extracted_link
             globals()["pending_link"]    = None
             await event.reply(
                 f"🔗 **Addlist rilevata!**\n{SEPL}\n"
