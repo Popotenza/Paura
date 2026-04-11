@@ -32,8 +32,9 @@ log = logging.getLogger(__name__)
 CONFIG_FILE       = os.path.join(os.path.dirname(__file__), "config.json")
 SLAVE_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slave_config.json")
 
-trigger_now = asyncio.Event()
-config: dict = {}
+trigger_now    = asyncio.Event()
+config: dict   = {}
+_folder_tasks: dict[str, asyncio.Task] = {}   # task per ogni regola cartella
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -50,6 +51,7 @@ def load_config() -> dict:
         cfg.setdefault("running", True)
         cfg.setdefault("rotation_indices", {})
         cfg.setdefault("auto_reply_text", "")
+        cfg.setdefault("folder_rules", {})
         return cfg
     return {
         "sources": [],
@@ -62,6 +64,7 @@ def load_config() -> dict:
         "buttons_rows": [],
         "rotation_indices": {},
         "auto_reply_text": "",
+        "folder_rules": {},
     }
 
 def save_config(cfg: dict) -> None:
@@ -87,13 +90,13 @@ async def update_slave_config(client: TelegramClient, cfg: dict) -> None:
         resolved_slave_sources[k] = [await resolve(p) for p in peers]
 
     slave_cfg = {
-        "sources":        sources,
-        "targets":        targets,
-        "buttons_rows":   cfg.get("buttons_rows", []),
-        "interval":       cfg.get("interval", 10),
+        "sources":         sources,
+        "targets":         targets,
+        "buttons_rows":    cfg.get("buttons_rows", []),
+        "interval":        cfg.get("interval", 10),
         "slave_intervals": cfg.get("slave_intervals", {}),
-        "slave_sources":  resolved_slave_sources,
-        "running":        cfg.get("running", True),
+        "slave_sources":   resolved_slave_sources,
+        "running":         cfg.get("running", True),
         "auto_reply_text": cfg.get("auto_reply_text", ""),
     }
     with open(SLAVE_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -222,7 +225,9 @@ async def add_folder_to_list(client: TelegramClient, event, folder_name: str, is
 
 # ── Invio messaggi ────────────────────────────────────────────────────────────
 
-async def copy_to_target(client: TelegramClient, msg, target, cfg: dict, _retries: int = 0) -> None:
+async def copy_to_target(
+    client: TelegramClient, msg, target, cfg: dict, _retries: int = 0,
+) -> None:
     try:
         text     = msg.message or getattr(msg, "caption", "") or ""
         entities = msg.entities or []
@@ -235,7 +240,7 @@ async def copy_to_target(client: TelegramClient, msg, target, cfg: dict, _retrie
                     formatting_entities=entities, buttons=buttons, silent=False
                 )
             except Exception as media_err:
-                log.warning(f"Media fallito su {target} ({media_err}) — invio solo testo")
+                log.warning(f"⚠️ Media fallito su {target} ({media_err}) — invio solo testo")
                 if text:
                     await client.send_message(target, text, formatting_entities=entities, buttons=buttons)
         else:
@@ -253,13 +258,25 @@ async def copy_to_target(client: TelegramClient, msg, target, cfg: dict, _retrie
     except Exception as e:
         log.error(f"❌ Errore → {target}: {e}")
 
+def _folder_rule_peer_ids(cfg: dict) -> set:
+    """Ritorna tutti i peer_id gestiti da una regola cartella (esclusi dal loop principale)."""
+    ids = set()
+    for rule in cfg.get("folder_rules", {}).values():
+        ids.update(str(p) for p in rule.get("peers", []))
+    return ids
+
 async def send_to_all(client: TelegramClient, msg, cfg: dict) -> None:
     if not cfg["targets"]:
         return
-    await asyncio.gather(*[copy_to_target(client, msg, t, cfg) for t in cfg["targets"]])
+    # Esclude i target gestiti da regole cartella
+    folder_peers = _folder_rule_peer_ids(cfg)
+    targets = [t for t in cfg["targets"] if str(t) not in folder_peers]
+    if not targets:
+        return
+    await asyncio.gather(*[copy_to_target(client, msg, t, cfg) for t in targets])
 
 
-# ── Spam loop ─────────────────────────────────────────────────────────────────
+# ── Spam loop principale ──────────────────────────────────────────────────────
 
 async def spam_loop(client: TelegramClient, cfg: dict) -> None:
     while True:
@@ -299,12 +316,79 @@ async def spam_loop(client: TelegramClient, cfg: dict) -> None:
             save_config(cfg)
 
 
+# ── Loop regola cartella ──────────────────────────────────────────────────────
+
+async def folder_rule_loop(client: TelegramClient, folder_name: str) -> None:
+    """Loop indipendente per una cartella con sorgente e intervallo dedicati."""
+    log.info(f"📁 Loop cartella '{folder_name}' avviato")
+
+    while True:
+        rule = config.get("folder_rules", {}).get(folder_name)
+        if not rule:
+            log.info(f"📁 Regola '{folder_name}' rimossa — loop terminato")
+            return
+
+        interval = max(1, rule.get("interval", 10))
+        await asyncio.sleep(interval * 60)
+
+        # Rilegge la regola dopo il sleep (potrebbe essere cambiata)
+        rule = config.get("folder_rules", {}).get(folder_name)
+        if not rule:
+            return
+
+        if not config.get("running", True):
+            continue
+
+        source = rule.get("source")
+        peers  = rule.get("peers", [])
+
+        if not source or not peers:
+            log.info(f"📁 Cartella '{folder_name}' senza sorgente o peer — salto")
+            continue
+
+        try:
+            all_msgs = await client.get_messages(source, limit=200)
+            valid = sorted([m for m in all_msgs if m.message or m.media], key=lambda m: m.id)
+            if not valid:
+                log.info(f"📭 Nessun post in {source} per la cartella '{folder_name}'")
+                continue
+
+            rot_key = f"folder_{folder_name}"
+            idx = config.setdefault("rotation_indices", {}).get(rot_key, 0) % len(valid)
+            msg = valid[idx]
+            log.info(
+                f"📤 [Cartella '{folder_name}'] Post {idx + 1}/{len(valid)} "
+                f"(id={msg.id}) da {source} → {len(peers)} gruppi"
+            )
+
+            await asyncio.gather(*[copy_to_target(client, msg, t, config) for t in peers])
+            config["rotation_indices"][rot_key] = (idx + 1) % len(valid)
+            save_config(config)
+
+        except Exception as e:
+            log.error(f"❌ Errore cartella '{folder_name}': {e}")
+
+
+def _start_folder_task(client: TelegramClient, folder_name: str) -> None:
+    """Avvia (o riavvia) il task per una regola cartella."""
+    old = _folder_tasks.get(folder_name)
+    if old and not old.done():
+        old.cancel()
+    _folder_tasks[folder_name] = asyncio.create_task(folder_rule_loop(client, folder_name))
+
+def _stop_folder_task(folder_name: str) -> None:
+    """Ferma il task di una regola cartella."""
+    task = _folder_tasks.pop(folder_name, None)
+    if task and not task.done():
+        task.cancel()
+
+
 # ── Aggiungi entità ───────────────────────────────────────────────────────────
 
 async def add_entity(client: TelegramClient, event, link: str, is_source: bool) -> None:
     global config
     try:
-        target = "me" if link.lower() in ["me", "saved"] else link.strip()
+        target  = "me" if link.lower() in ["me", "saved"] else link.strip()
         entity  = await client.get_entity(target)
         peer_id = get_peer_id(entity)
         key     = "sources" if is_source else "targets"
@@ -352,7 +436,7 @@ async def start_http_server() -> None:
         await asyncio.sleep(3600)
 
 
-# ── Messaggi Telegram ─────────────────────────────────────────────────────────
+# ── Testi Telegram ────────────────────────────────────────────────────────────
 
 HELP_TEXT = """📋 **COMANDI MASTER**
 
@@ -380,6 +464,11 @@ HELP_TEXT = """📋 **COMANDI MASTER**
 `/sil` — lista intervalli slave
 `/sir` — resetta intervalli slave al default
 
+📁 **Regole per cartella** _(sorgente e intervallo dedicati)_
+`/fr NomeCartella @fonte 5` — imposta regola
+`/frl` — lista regole cartelle
+`/frd NomeCartella` — elimina regola cartella
+
 🔘 **Bottoni inline**
 `/b` — mostra bottoni + istruzioni
 `/bclear` — rimuovi tutti i bottoni
@@ -396,12 +485,13 @@ HELP_TEXT = """📋 **COMANDI MASTER**
 
 
 def _stato_text(cfg: dict) -> str:
-    stato      = "🟢 Attivo" if cfg["running"] else "🔴 Fermo"
-    n_src      = len(cfg.get("sources", []))
-    n_tgt      = len(cfg.get("targets", []))
-    n_btn      = sum(len(r) for r in cfg.get("buttons_rows", []))
-    reply_on   = "✅ attiva" if cfg.get("auto_reply_text") else "❌ non impostata"
-    interval   = cfg.get("interval", 10)
+    stato    = "🟢 Attivo" if cfg["running"] else "🔴 Fermo"
+    n_src    = len(cfg.get("sources", []))
+    n_tgt    = len(cfg.get("targets", []))
+    n_btn    = sum(len(r) for r in cfg.get("buttons_rows", []))
+    reply_on = "✅ attiva" if cfg.get("auto_reply_text") else "❌ non impostata"
+    interval = cfg.get("interval", 10)
+    n_rules  = len(cfg.get("folder_rules", {}))
 
     si = cfg.get("slave_intervals", {})
     si_lines = ("\n" + "\n".join(
@@ -422,6 +512,7 @@ def _stato_text(cfg: dict) -> str:
         f"📥 Sorgenti master: **{n_src}**\n"
         f"📥 Sorgenti slave:{ss_lines}\n"
         f"📤 Destinazioni: **{n_tgt}**\n\n"
+        f"📁 Regole cartella: **{n_rules}**\n"
         f"🔘 Bottoni: **{n_btn}**\n"
         f"💬 Auto-risposta: {reply_on}"
     )
@@ -458,6 +549,116 @@ async def handle_command(client: TelegramClient, event, text: str) -> None:
         save_config(config)
         await update_slave_config(client, config)
         await event.reply("🔄 **Reset completato.**\nSorgenti, destinazioni e cronologia azzerati.")
+
+    # ── Regole cartella ────────────────────────────────────────────────────────
+
+    elif text.startswith("/fr "):
+        # /fr NomeCartella @fonte intervallo
+        try:
+            parts = text.split(maxsplit=3)
+            if len(parts) < 4:
+                raise ValueError("Argomenti insufficienti")
+
+            folder_name = parts[1]
+            source_link = parts[2]
+            interval    = max(1, int(parts[3]))
+
+            # Risolve la sorgente
+            source_entity  = await client.get_entity(source_link)
+            source_peer_id = get_peer_id(source_entity)
+            source_name    = (
+                getattr(source_entity, "title", None)
+                or getattr(source_entity, "username", None)
+                or str(source_peer_id)
+            )
+
+            # Risolve i peer della cartella
+            folders = await get_folders(client)
+            matched = next(
+                (f for f in folders if _folder_title(f).lower() == folder_name.lower()), None
+            )
+            if not matched:
+                available = "\n".join(f"  • {_folder_title(f)}" for f in folders)
+                await event.reply(
+                    f"❌ Cartella **{folder_name}** non trovata.\n\n"
+                    f"📁 **Disponibili:**\n{available}"
+                )
+                return
+
+            peers_data = await resolve_folder_peers(client, matched)
+            peer_ids   = [p[0] for p in peers_data]
+            peer_names = [p[1] for p in peers_data]
+
+            if not peer_ids:
+                await event.reply("⚠️ Cartella vuota o non risolvibile.")
+                return
+
+            config.setdefault("folder_rules", {})[folder_name] = {
+                "source":   source_peer_id,
+                "interval": interval,
+                "peers":    peer_ids,
+            }
+            save_config(config)
+            _start_folder_task(client, folder_name)
+
+            preview = "\n".join(f"  • {n}" for n in peer_names[:10])
+            extra   = f"\n  _(e altri {len(peer_names) - 10})_" if len(peer_names) > 10 else ""
+            await event.reply(
+                f"✅ **Regola cartella impostata!**\n\n"
+                f"📁 Cartella: **{_folder_title(matched)}**\n"
+                f"📥 Sorgente: `{source_name}`\n"
+                f"⏱ Intervallo: **{interval} min**\n"
+                f"📤 Gruppi: **{len(peer_ids)}**\n{preview}{extra}\n\n"
+                f"ℹ️ Questi gruppi ricevono solo messaggi da questa regola,\n"
+                f"non dal loop principale."
+            )
+
+        except (IndexError, ValueError):
+            await event.reply(
+                "ℹ️ Uso: `/fr NomeCartella @fonte 5`\n\n"
+                "Esempio: `/fr Hot @miospam 3`\n"
+                "→ invia da @miospam ogni 3 min a tutti i gruppi della cartella Hot"
+            )
+        except Exception as e:
+            await event.reply(f"❌ Errore: `{e}`")
+
+    elif text == "/frl":
+        rules = config.get("folder_rules", {})
+        if not rules:
+            await event.reply(
+                "📁 Nessuna regola cartella configurata.\n\n"
+                "Usa `/fr NomeCartella @fonte 5` per crearne una."
+            )
+        else:
+            lines = []
+            for name, rule in rules.items():
+                src = rule.get("source", "?")
+                ivl = rule.get("interval", "?")
+                n   = len(rule.get("peers", []))
+                lines.append(f"  • **{name}** — `{src}` ogni **{ivl} min** ({n} gruppi)")
+            await event.reply(
+                f"📁 **Regole cartella ({len(rules)}):**\n\n"
+                + "\n".join(lines)
+                + "\n\n`/frd NomeCartella` per eliminare"
+            )
+
+    elif text.startswith("/frd "):
+        folder_name = text.split(maxsplit=1)[1].strip()
+        rules = config.get("folder_rules", {})
+        if folder_name in rules:
+            del rules[folder_name]
+            config["folder_rules"] = rules
+            save_config(config)
+            _stop_folder_task(folder_name)
+            await event.reply(
+                f"🗑 **Regola eliminata** per `{folder_name}`.\n"
+                "I suoi gruppi tornano al loop principale."
+            )
+        else:
+            await event.reply(
+                f"⚠️ Nessuna regola trovata per `{folder_name}`.\n"
+                "Usa `/frl` per vedere le regole attive."
+            )
 
     # ── Bottoni ────────────────────────────────────────────────────────────────
 
@@ -554,7 +755,8 @@ async def handle_command(client: TelegramClient, event, text: str) -> None:
             await event.reply(
                 f"📁 **Cartelle Telegram:**\n\n{lines}\n\n"
                 "`/sf NomeCartella` → aggiungi come sorgenti\n"
-                "`/tf NomeCartella` → aggiungi come destinazioni"
+                "`/tf NomeCartella` → aggiungi come destinazioni\n"
+                "`/fr NomeCartella @fonte 5` → regola dedicata"
             )
         except Exception as e:
             await event.reply(f"❌ Errore: `{e}`")
@@ -755,11 +957,17 @@ async def main() -> None:
     log.info(
         f"🚀 Master avviato | "
         f"{len(config['sources'])} sorgenti | "
-        f"{len(config['targets'])} destinazioni"
+        f"{len(config['targets'])} destinazioni | "
+        f"{len(config.get('folder_rules', {}))} regole cartella"
     )
 
     if config["running"]:
         trigger_now.set()
+
+    # Avvia i task per le regole cartella già salvate
+    for folder_name in config.get("folder_rules", {}):
+        _start_folder_task(client, folder_name)
+        log.info(f"📁 Task cartella '{folder_name}' avviato da config salvata")
 
     globals()["pending_link"] = None
 
@@ -777,6 +985,8 @@ async def main() -> None:
 
     spam_task.cancel()
     http_task.cancel()
+    for task in _folder_tasks.values():
+        task.cancel()
 
 
 if __name__ == "__main__":
